@@ -45,11 +45,248 @@ class KernelBuilder:
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
 
-    def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = False):
-        # Simple slot packing that just uses one slot per instruction bundle
+    def get_slot_reads_writes(self, engine: str, slot: tuple) -> tuple[set, set]:
+        """
+        Analyze a slot to determine which scratch addresses it reads and writes.
+        Returns (reads, writes) as sets of addresses.
+        """
+        reads = set()
+        writes = set()
+
+        if engine == "alu":
+            # (op, dest, src1, src2)
+            op, dest, src1, src2 = slot
+            writes.add(dest)
+            reads.add(src1)
+            reads.add(src2)
+        elif engine == "valu":
+            if slot[0] == "vbroadcast":
+                # (vbroadcast, dest, src)
+                _, dest, src = slot
+                for i in range(VLEN):
+                    writes.add(dest + i)
+                reads.add(src)
+            elif slot[0] == "multiply_add":
+                # (multiply_add, dest, a, b, c)
+                _, dest, a, b, c = slot
+                for i in range(VLEN):
+                    writes.add(dest + i)
+                    reads.add(a + i)
+                    reads.add(b + i)
+                    reads.add(c + i)
+            else:
+                # (op, dest, src1, src2)
+                op, dest, src1, src2 = slot
+                for i in range(VLEN):
+                    writes.add(dest + i)
+                    reads.add(src1 + i)
+                    reads.add(src2 + i)
+        elif engine == "load":
+            if slot[0] == "load":
+                # (load, dest, addr_reg)
+                _, dest, addr_reg = slot
+                writes.add(dest)
+                reads.add(addr_reg)
+            elif slot[0] == "vload":
+                # (vload, dest, addr_reg) - loads VLEN elements
+                _, dest, addr_reg = slot
+                for i in range(VLEN):
+                    writes.add(dest + i)
+                reads.add(addr_reg)
+            elif slot[0] == "const":
+                # (const, dest, value) - no reads
+                _, dest, _ = slot
+                writes.add(dest)
+            elif slot[0] == "load_offset":
+                # (load_offset, dest, addr, offset)
+                _, dest, addr, offset = slot
+                writes.add(dest + offset)
+                reads.add(addr + offset)
+        elif engine == "store":
+            if slot[0] == "store":
+                # (store, addr_reg, src)
+                _, addr_reg, src = slot
+                reads.add(addr_reg)
+                reads.add(src)
+            elif slot[0] == "vstore":
+                # (vstore, addr_reg, src)
+                _, addr_reg, src = slot
+                reads.add(addr_reg)
+                for i in range(VLEN):
+                    reads.add(src + i)
+        elif engine == "flow":
+            if slot[0] == "select":
+                # (select, dest, cond, a, b)
+                _, dest, cond, a, b = slot
+                writes.add(dest)
+                reads.add(cond)
+                reads.add(a)
+                reads.add(b)
+            elif slot[0] == "vselect":
+                # (vselect, dest, cond, a, b)
+                _, dest, cond, a, b = slot
+                for i in range(VLEN):
+                    writes.add(dest + i)
+                    reads.add(cond + i)
+                    reads.add(a + i)
+                    reads.add(b + i)
+            elif slot[0] in ("pause", "halt"):
+                pass  # No reads/writes
+            elif slot[0] == "cond_jump":
+                _, cond, _ = slot
+                reads.add(cond)
+            elif slot[0] == "cond_jump_rel":
+                _, cond, _ = slot
+                reads.add(cond)
+            elif slot[0] == "add_imm":
+                _, dest, a, _ = slot
+                writes.add(dest)
+                reads.add(a)
+        elif engine == "debug":
+            pass  # Debug instructions don't affect scheduling
+
+        return reads, writes
+
+    def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = True):
+        """
+        Pack slots into instruction bundles using VLIW scheduling.
+
+        Respects dependencies (RAW, WAR, WAW) and slot limits per engine.
+        Uses an efficient algorithm that tracks pending writes.
+        """
+        if not vliw or not slots:
+            # Fall back to simple one-slot-per-bundle
+            instrs = []
+            for engine, slot in slots:
+                instrs.append({engine: [slot]})
+            return instrs
+
+        # Analyze each slot for reads/writes
+        slot_info = []
+        for i, (engine, slot) in enumerate(slots):
+            reads, writes = self.get_slot_reads_writes(engine, slot)
+            slot_info.append({
+                'idx': i,
+                'engine': engine,
+                'slot': slot,
+                'reads': reads,
+                'writes': writes,
+                'scheduled': False,
+                # Track which slot index this depends on (RAW dependency)
+                'ready_after': -1,
+            })
+
+        # Build dependency graph: for each slot, find ALL slots it depends on
+        # This is O(n) per slot using maps from address -> last writer/reader
+        last_writer = {}  # address -> slot index that last wrote to it
+        last_reader = {}  # address -> slot index that last read from it
+
+        for i, info in enumerate(slot_info):
+            deps = set()
+            # RAW: we read something that was written earlier
+            for addr in info['reads']:
+                if addr in last_writer:
+                    deps.add(last_writer[addr])
+            # WAW: we write something that was written earlier
+            for addr in info['writes']:
+                if addr in last_writer:
+                    deps.add(last_writer[addr])
+            # WAR: we write something that was read earlier
+            for addr in info['writes']:
+                if addr in last_reader:
+                    deps.add(last_reader[addr])
+            info['deps'] = deps  # All dependencies
+
+            # Update last_writer for our writes
+            for addr in info['writes']:
+                last_writer[addr] = i
+            # Update last_reader for our reads
+            for addr in info['reads']:
+                last_reader[addr] = i
+
+        # Schedule using a greedy algorithm
         instrs = []
-        for engine, slot in slots:
-            instrs.append({engine: [slot]})
+        num_scheduled = 0
+        total = len(slots)
+        current_cycle_start = 0  # Index of first slot that could be in current bundle
+
+        while num_scheduled < total:
+            bundle = defaultdict(list)
+            bundle_writes = set()
+            bundle_reads = set()
+            slot_counts = defaultdict(int)
+            scheduled_this_cycle = []
+            scheduled_this_cycle_set = set()
+
+            for i in range(current_cycle_start, total):
+                info = slot_info[i]
+                if info['scheduled']:
+                    continue
+
+                engine = info['engine']
+                slot = info['slot']
+                reads = info['reads']
+                writes = info['writes']
+
+                # Check if ALL dependencies are satisfied
+                # All deps must be scheduled in a PREVIOUS cycle (not this one)
+                deps_satisfied = True
+                for dep in info['deps']:
+                    if not slot_info[dep]['scheduled']:
+                        deps_satisfied = False
+                        break
+                    # If dep was scheduled this cycle, we can't be in same bundle
+                    if dep in scheduled_this_cycle_set:
+                        deps_satisfied = False
+                        break
+                if not deps_satisfied:
+                    continue
+
+                # Check slot limit
+                if slot_counts[engine] >= SLOT_LIMITS.get(engine, 1):
+                    continue
+
+                # Check WAW within bundle
+                if writes & bundle_writes:
+                    continue
+
+                # Check WAR within bundle
+                if writes & bundle_reads:
+                    continue
+
+                # Check RAW within bundle: can't read from address written in this bundle
+                if reads & bundle_writes:
+                    continue
+
+                # Schedule this slot
+                bundle[engine].append(slot)
+                bundle_writes |= writes
+                bundle_reads |= reads
+                slot_counts[engine] += 1
+                scheduled_this_cycle.append(i)
+                scheduled_this_cycle_set.add(i)
+
+            # Mark scheduled
+            for i in scheduled_this_cycle:
+                slot_info[i]['scheduled'] = True
+                num_scheduled += 1
+
+            # Update current_cycle_start to skip already scheduled slots
+            while current_cycle_start < total and slot_info[current_cycle_start]['scheduled']:
+                current_cycle_start += 1
+
+            if bundle:
+                instrs.append(dict(bundle))
+            elif num_scheduled < total:
+                # Safety: force schedule next unscheduled slot
+                for i in range(total):
+                    if not slot_info[i]['scheduled']:
+                        info = slot_info[i]
+                        instrs.append({info['engine']: [info['slot']]})
+                        info['scheduled'] = True
+                        num_scheduled += 1
+                        break
+
         return instrs
 
     def add(self, engine, slot):
@@ -167,58 +404,60 @@ class KernelBuilder:
         self.add("flow", ("pause",))
         self.add("debug", ("comment", "Starting vectorized loop"))
 
-        body = []
-
+        # Process each batch separately to prevent VLIW from interleaving
+        # (batches share scratch variables like v_idx, v_val, so they can't overlap)
         for round in range(rounds):
             for i in range(0, batch_size, VLEN):  # Step by 8
+                batch_body = []
                 batch_offset = self.scratch_const(i)
 
                 # Load 8 indices: v_idx = mem[inp_indices_p + i : inp_indices_p + i + 8]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], batch_offset)))
-                body.append(("load", ("vload", v_idx, tmp_addr)))
+                batch_body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], batch_offset)))
+                batch_body.append(("load", ("vload", v_idx, tmp_addr)))
 
                 # Load 8 values: v_val = mem[inp_values_p + i : inp_values_p + i + 8]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], batch_offset)))
-                body.append(("load", ("vload", v_val, tmp_addr)))
+                batch_body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], batch_offset)))
+                batch_body.append(("load", ("vload", v_val, tmp_addr)))
 
                 # Gather 8 tree values (this is the bottleneck - non-contiguous access)
                 # v_node_val[j] = mem[forest_values_p + v_idx[j]] for j in 0..7
                 for j in range(VLEN):
-                    body.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], v_idx + j)))
-                    body.append(("load", ("load", v_node_val + j, tmp_addr)))
+                    batch_body.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], v_idx + j)))
+                    batch_body.append(("load", ("load", v_node_val + j, tmp_addr)))
 
                 # XOR values with node values: v_val = v_val ^ v_node_val
-                body.append(("valu", ("^", v_val, v_val, v_node_val)))
+                batch_body.append(("valu", ("^", v_val, v_val, v_node_val)))
 
                 # Vectorized hash computation (18 valu operations)
-                body.extend(self.build_hash_vectorized(v_val, v_tmp1, v_tmp2))
+                batch_body.extend(self.build_hash_vectorized(v_val, v_tmp1, v_tmp2))
 
                 # Compute next index: idx = 2*idx + (1 if val%2==0 else 2)
                 # v_tmp1 = v_val & 1 (faster than %)
-                body.append(("valu", ("&", v_tmp1, v_val, v_one)))
+                batch_body.append(("valu", ("&", v_tmp1, v_val, v_one)))
                 # v_tmp1 = (v_tmp1 == 0) ? 1 : 0
-                body.append(("valu", ("==", v_tmp1, v_tmp1, v_zero)))
+                batch_body.append(("valu", ("==", v_tmp1, v_tmp1, v_zero)))
                 # v_tmp3 = v_tmp1 ? 1 : 2 (if even, add 1; if odd, add 2)
-                body.append(("flow", ("vselect", v_tmp3, v_tmp1, v_one, v_two)))
+                batch_body.append(("flow", ("vselect", v_tmp3, v_tmp1, v_one, v_two)))
                 # v_idx = 2 * v_idx
-                body.append(("valu", ("*", v_idx, v_idx, v_two)))
+                batch_body.append(("valu", ("*", v_idx, v_idx, v_two)))
                 # v_idx = v_idx + v_tmp3
-                body.append(("valu", ("+", v_idx, v_idx, v_tmp3)))
+                batch_body.append(("valu", ("+", v_idx, v_idx, v_tmp3)))
 
                 # Wrap index: idx = 0 if idx >= n_nodes else idx
-                body.append(("valu", ("<", v_tmp1, v_idx, v_n_nodes)))
-                body.append(("flow", ("vselect", v_idx, v_tmp1, v_idx, v_zero)))
+                batch_body.append(("valu", ("<", v_tmp1, v_idx, v_n_nodes)))
+                batch_body.append(("flow", ("vselect", v_idx, v_tmp1, v_idx, v_zero)))
 
                 # Store 8 indices: mem[inp_indices_p + i : ...] = v_idx
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], batch_offset)))
-                body.append(("store", ("vstore", tmp_addr, v_idx)))
+                batch_body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], batch_offset)))
+                batch_body.append(("store", ("vstore", tmp_addr, v_idx)))
 
                 # Store 8 values: mem[inp_values_p + i : ...] = v_val
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], batch_offset)))
-                body.append(("store", ("vstore", tmp_addr, v_val)))
+                batch_body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], batch_offset)))
+                batch_body.append(("store", ("vstore", tmp_addr, v_val)))
 
-        body_instrs = self.build(body)
-        self.instrs.extend(body_instrs)
+                # Pack this batch's instructions (VLIW can reorder within batch only)
+                batch_instrs = self.build(batch_body)
+                self.instrs.extend(batch_instrs)
         # Required to match with the yield in reference_kernel2
         self.instrs.append({"flow": [("pause",)]})
 
